@@ -1,18 +1,24 @@
-# ng_migrate — Angular 13 → 20
+# ng_migrate — Migración automática de Angular
 
-Script Python para migrar proyectos Angular de la versión 13 a la 20 de forma automática, paso a paso, sin usar `npx`. Compatible con npm, pnpm y yarn, proyectos CLI y monorepos Nx, Angular Material, y con sistema de snapshots, reportes HTML y auto-corrección de errores de build.
+Script Python para migrar proyectos Angular paso a paso hasta la **versión 20**, sin usar `npx`. Detecta automáticamente la versión actual del proyecto y reanuda donde quedó si se interrumpe. Compatible con npm, pnpm y yarn, proyectos CLI y monorepos Nx.
 
 ---
 
 ## Características
 
-- **Migración paso a paso** v14 → v15 → v16 → v17 → v18 → v19 → v20, validando build de producción en cada salto
+- **Detección automática de versión** — lee la versión actual desde `package.json` y calcula los pasos necesarios
+- **Migración paso a paso** con build de producción validado en cada salto
+- **Reanuda automáticamente** — si se interrumpe en v17, al volver a ejecutar retoma desde v18
+- **Output en tiempo real** — muestra la salida de installs y builds mientras corren, sin esperas silenciosas
 - **Auto-detección** del gestor de paquetes (npm / pnpm / yarn) y de monorepos Nx
 - **Pin de TypeScript** por versión de Angular — asigna la versión exacta compatible antes de cada salto
 - **Snapshots ZIP** antes y después de cada versión — modos `full`, `lite` u `off`
-- **Reporte HTML** con diff de `package.json` y salida de build por cada paso
+- **Reporte HTML** con diff de `package.json` y salida de build por cada paso, con caracteres especiales correctamente escapados
 - **Auto-fix inteligente** — parsea errores de build (NG8001 / NG8002) y parchea imports de módulos Angular automáticamente
 - **Normalizador de MaterialModule** — reescribe/crea `material.module.ts` compatible con Angular 14+
+- **Migraciones de librerías populares** — detecta NgRx, Angular Fire, Transloco, PrimeNG, ng-zorro, ng-bootstrap y otras, y ejecuta sus migraciones automáticamente
+- **Limpieza de caché Angular** — borra `.angular/cache` antes de cada build para evitar falsos negativos
+- **Soporte SSR** — con `--check-ssr` compila el target `:server` en cada paso si existe
 - **Soporte `@angular/build`** — detecta y actualiza el nuevo paquete de build desde Angular 17
 - **Codemods opcionales** (todos desactivados por defecto):
   - `--standalone` — convierte módulos a componentes Standalone
@@ -28,7 +34,7 @@ Script Python para migrar proyectos Angular de la versión 13 a la 20 de forma a
 | Requisito | Versión |
 |-----------|---------|
 | Python    | 3.9+    |
-| Node.js   | ≥ 20.19 (recomendado 22.x) |
+| Node.js   | >= 20.19 (recomendado 22.x) |
 | npm       | incluido con Node |
 
 > pnpm y yarn se detectan automáticamente si existe su archivo de lock.
@@ -48,38 +54,43 @@ python ng_migrate.py
 ```
 uso: ng_migrate.py [-h] [--snapshot {full,lite,off}] [--standalone]
                    [--control-flow] [--material-mdc] [--material-m3]
-                   [--check-ssr] [--restore RESTORE]
+                   [--check-ssr] [--from-version N] [--restore RESTORE]
 
 opciones:
   -h, --help                  muestra esta ayuda y sale
-  --snapshot {full,lite,off}  modo de snapshot (por defecto: lite)
-  --standalone                aplica codemods Standalone
+  --snapshot {full,lite,off}  modo de snapshot: full=todos los archivos,
+                              lite=solo codigo, off=sin backups (default: lite)
+  --standalone                aplica codemods Standalone al final
   --control-flow              convierte *ngIf/*ngFor/*ngSwitch a @if/@for/@switch
-  --material-mdc              aplica migración MDC (Material)
+  --material-mdc              aplica migracion MDC (Angular Material)
   --material-m3               genera base de tema Material 3
-  --check-ssr                 intenta compilar el target :server si existe (SSR)
+  --check-ssr                 compila target :server en cada paso si existe (SSR)
+  --from-version N            empieza desde la version N (14-20), saltando anteriores
   --restore RESTORE           restaura snapshot: nombre.zip o 'latest'
 ```
 
 ### Ejemplos
 
 ```bash
-# Migración básica (snapshots lite, sin codemods)
+# Migracion basica — detecta version actual y arranca (snapshots lite, sin codemods)
 python ng_migrate.py
 
-# Migración completa con todos los codemods modernos
-python ng_migrate.py --standalone --control-flow --material-mdc --material-m3
+# Migracion completa con codemods modernos y verificacion SSR
+python ng_migrate.py --standalone --control-flow --material-mdc --check-ssr
 
-# Sin snapshots (más rápido, menos espacio en disco)
+# Sin snapshots (mas rapido, menos espacio en disco)
 python ng_migrate.py --snapshot off
 
 # Snapshots completos (incluye todos los archivos del proyecto)
 python ng_migrate.py --snapshot full
 
-# Volver al último snapshot guardado
+# Retomar manualmente desde v17 (saltando v14, v15, v16)
+python ng_migrate.py --from-version 17
+
+# Volver al ultimo snapshot guardado
 python ng_migrate.py --restore latest
 
-# Volver a un snapshot específico
+# Volver a un snapshot especifico
 python ng_migrate.py --restore .migrate_backups/20250910-120000_pre_v16.zip
 ```
 
@@ -88,30 +99,54 @@ python ng_migrate.py --restore .migrate_backups/20250910-120000_pre_v16.zip
 ## Cómo funciona
 
 ```
-Angular 13
-    │
-    ├── snapshot pre_v14
-    ├── Pin TypeScript ~4.6.4
-    ├── ng update @angular/core@14 @angular/cli@14
-    ├── ng update @angular/material@14
-    ├── install + dedupe
-    ├── Build de producción → auto-fix si falla → reintento
-    └── snapshot post_v14
-    │
-    ├── (igual para v15, v16, v17)
-    │
-    ├── snapshot pre_v18
-    ├── Migración al application builder (v18+)
-    ├── Build de producción...
-    └── snapshot post_v18
-    │
-    ├── (v19, v20)
-    │
-    ├── Codemods opcionales (standalone, control-flow, MDC, M3)
-    ├── Actualización de terceros (rxjs ^7.8, zone.js ^0.14)
-    ├── ng lint --fix
-    └── Build final → reporte HTML
+package.json (cualquier version >= 13)
+    |
+    +-- Detecta version actual (@angular/core)
+    +-- Verifica ultimo salto exitoso (.migrate_state.json)
+    |
+    Para cada salto (version_actual+1 --> 20):
+    |
+    +-- snapshot pre_vN
+    +-- Pin TypeScript compatible
+    +-- Limpia cache Angular (.angular/cache)
+    +-- ng update @angular/core@N @angular/cli@N
+    +-- ng update @angular/material@N  (si aplica)
+    +-- ng update de librerias detectadas (NgRx, Fire, etc.)
+    +-- Migracion al application builder  (v18+)
+    +-- npm install + dedupe
+    +-- Build de produccion
+    |       |
+    |       +-- OK --> snapshot post_vN, guarda progreso
+    |       +-- FALLA --> auto-fix (NG8001/NG8002) --> reintento
+    |                         |
+    |                         +-- OK --> continua
+    |                         +-- FALLA --> reporte HTML + para
+    |                                      (corregir a mano y re-ejecutar
+    |                                       reanuda desde este paso)
+    +-- Build SSR (:server) si --check-ssr
+    |
+    Codemods opcionales (standalone, control-flow, MDC, M3)
+    Actualizacion de terceros (rxjs ^7.8, zone.js ^0.14)
+    ng lint --fix
+    Build final --> reporte HTML
 ```
+
+### Librerías de terceros detectadas automáticamente
+
+Si el proyecto tiene alguna de estas librerías, el script ejecuta `ng update` por cada una en cada salto:
+
+| Librería | Paquete |
+|----------|---------|
+| NgRx | `@ngrx/store`, `@ngrx/effects`, `@ngrx/entity`, `@ngrx/router-store`, `@ngrx/component-store` |
+| Angular Fire | `@angular/fire` |
+| ngx-translate | `@ngx-translate/core` |
+| Transloco | `@ngneat/transloco` |
+| NG-ZORRO | `ng-zorro-antd` |
+| PrimeNG | `primeng` |
+| NG Bootstrap | `@ng-bootstrap/ng-bootstrap` |
+| ngx-bootstrap | `ngx-bootstrap` |
+| NGX Datatable | `@swimlane/ngx-datatable` |
+| ngx-toastr | `ngx-toastr` |
 
 ### Mapa de versiones TypeScript
 
@@ -133,7 +168,7 @@ Angular 13
 |-------------------------|-------------|
 | `.migrate_backups/`     | Snapshots ZIP antes/después de cada salto de versión |
 | `.migrate_reports/`     | Reportes HTML con diffs y salida de build por paso |
-| `.migrate_state.json`   | Estado interno (índice de snapshots) |
+| `.migrate_state.json`   | Estado interno: snapshots y versiones completadas (permite reanudar) |
 | `last_build_error.log`  | Salida cruda del último build fallido — útil para depurar |
 
 ---
@@ -146,8 +181,8 @@ Cuando un build falla, el script:
    - **NG8001** — elemento desconocido → importa el módulo correcto o añade `CUSTOM_ELEMENTS_SCHEMA`
    - **NG8002** — propiedad desconocida → importa los módulos de Material (tabla, paginador, sort) según corresponda
 2. Aplica los fixes directamente en los archivos `*.module.ts` afectados
-3. Reintenta el build una vez
-4. Si sigue fallando, escribe el reporte HTML y sale con mensaje de error claro
+3. Limpia la caché Angular y reintenta el build
+4. Si sigue fallando, escribe el reporte HTML y para con instrucciones claras
 
 ---
 
@@ -168,12 +203,18 @@ El script para y muestra el reporte HTML cuando un build falla y el auto-fix no 
 1. Abrí el reporte en `.migrate_reports/migration_report_*.html`
 2. Revisá `last_build_error.log` para ver el error completo
 3. Corregí el problema manualmente en tu código
-4. Volvé a ejecutar el script — va a retomar desde el último salto de versión exitoso
+4. Volvé a ejecutar el script — **reanuda automáticamente desde el último paso exitoso**
 
 Si el proyecto quedó en un estado inconsistente, podés restaurar el snapshot anterior:
 
 ```bash
 python ng_migrate.py --restore latest
+```
+
+También podés saltar directamente a un paso específico:
+
+```bash
+python ng_migrate.py --from-version 17
 ```
 
 ---
@@ -185,13 +226,12 @@ Estas situaciones **no se resuelven automáticamente** y requieren intervención
 | Limitación | Descripción |
 |------------|-------------|
 | **Errores de TypeScript en el código** | Cambios de API entre versiones de Angular (métodos deprecados, firmas modificadas). El script indica dónde falla pero no modifica lógica de negocio. |
-| **Librerías de terceros con breaking changes** | Paquetes como `@ngrx/*`, `@ngneat/*`, `@ngx-translate/*`, Angular Fire, etc. pueden tener migraciones propias que este script no ejecuta. |
-| **No retoma desde un paso intermedio** | Si el proceso para en v17, al volver a ejecutar recorre desde v14. Usar snapshots para no perder el trabajo ya hecho. |
-| **Auto-fix solo cubre NG8001 y NG8002** | Otros errores de compilación Angular (NG0XXX, errores de tipado, imports circulares) no se parchean automáticamente. |
+| **Librerías de terceros no listadas** | Paquetes fuera de la lista de detección automática pueden tener migraciones propias que el script no ejecuta. Revisarlas manualmente con `ng update <paquete>`. |
+| **Auto-fix solo cubre NG8001 y NG8002** | Otros errores de compilación Angular (errores de tipado, imports circulares, providers deprecados) no se parchean automáticamente. |
 | **Módulos muy complejos con `imports` dinámicos** | Lazy loading con strings, `loadChildren`, módulos condicionales o generados dinámicamente pueden necesitar ajuste manual. |
 | **Proyectos con `paths` custom en tsconfig** | Si el proyecto usa alias de rutas complejos, el auto-fix de imports puede generar rutas relativas incorrectas. |
-| **SSR / Universal** | El target `:server` se intenta compilar con `--check-ssr` pero no se aplican migraciones específicas de SSR automáticamente. |
-| **`--standalone` en módulos complejos** | El codemod de Standalone funciona en la mayoría de los casos pero puede requerir revisión manual en módulos con providers, forRoot/forChild o bootstrapping personalizado. |
+| **SSR / Universal** | El target `:server` se compila con `--check-ssr` pero no se aplican migraciones específicas de SSR automáticamente. |
+| **`--standalone` en módulos complejos** | El codemod de Standalone puede requerir revisión manual en módulos con providers, forRoot/forChild o bootstrapping personalizado. |
 
 ---
 
@@ -199,13 +239,11 @@ Estas situaciones **no se resuelven automáticamente** y requieren intervención
 
 Áreas donde el script puede evolucionar. Contribuciones bienvenidas:
 
-- [ ] **`--from-version N`** — reanudar la migración desde un salto específico sin necesidad de restaurar snapshot
 - [ ] **Modo dry-run** — mostrar qué pasos ejecutaría sin modificar nada
-- [ ] **Auto-fix extendido** — cubrir más errores: NG0100 (ExpressionChangedAfterItHasBeenChecked), imports circulares, providers deprecados
-- [ ] **Detección de librerías populares** — ejecutar automáticamente `ng update @ngrx/store`, `ng update @angular/fire`, etc. si están presentes
+- [ ] **Auto-fix extendido** — cubrir más errores: NG0100, imports circulares, providers deprecados
 - [ ] **Reporte mejorado** — incluir sugerencias de fix para cada error, no solo el log crudo
 - [ ] **Soporte multi-app avanzado** — migrar apps en el mismo workspace en orden de dependencia
-- [ ] **Validación previa** — chequear antes de empezar si hay breaking changes conocidos en dependencias de terceros
+- [ ] **Validación previa** — chequear antes de empezar si hay breaking changes conocidos en dependencias
 - [ ] **Integración con CI** — modo no-interactivo con exit codes claros para usar en pipelines
 
 ---
