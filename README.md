@@ -161,6 +161,55 @@ Cuando un build falla, el script:
 
 ---
 
+## Qué hacer si la migración se detiene
+
+El script para y muestra el reporte HTML cuando un build falla y el auto-fix no pudo resolverlo. En ese caso:
+
+1. Abrí el reporte en `.migrate_reports/migration_report_*.html`
+2. Revisá `last_build_error.log` para ver el error completo
+3. Corregí el problema manualmente en tu código
+4. Volvé a ejecutar el script — va a retomar desde el último salto de versión exitoso
+
+Si el proyecto quedó en un estado inconsistente, podés restaurar el snapshot anterior:
+
+```bash
+python ng_migrate.py --restore latest
+```
+
+---
+
+## Limitaciones conocidas
+
+Estas situaciones **no se resuelven automáticamente** y requieren intervención manual:
+
+| Limitación | Descripción |
+|------------|-------------|
+| **Errores de TypeScript en el código** | Cambios de API entre versiones de Angular (métodos deprecados, firmas modificadas). El script indica dónde falla pero no modifica lógica de negocio. |
+| **Librerías de terceros con breaking changes** | Paquetes como `@ngrx/*`, `@ngneat/*`, `@ngx-translate/*`, Angular Fire, etc. pueden tener migraciones propias que este script no ejecuta. |
+| **No retoma desde un paso intermedio** | Si el proceso para en v17, al volver a ejecutar recorre desde v14. Usar snapshots para no perder el trabajo ya hecho. |
+| **Auto-fix solo cubre NG8001 y NG8002** | Otros errores de compilación Angular (NG0XXX, errores de tipado, imports circulares) no se parchean automáticamente. |
+| **Módulos muy complejos con `imports` dinámicos** | Lazy loading con strings, `loadChildren`, módulos condicionales o generados dinámicamente pueden necesitar ajuste manual. |
+| **Proyectos con `paths` custom en tsconfig** | Si el proyecto usa alias de rutas complejos, el auto-fix de imports puede generar rutas relativas incorrectas. |
+| **SSR / Universal** | El target `:server` se intenta compilar con `--check-ssr` pero no se aplican migraciones específicas de SSR automáticamente. |
+| **`--standalone` en módulos complejos** | El codemod de Standalone funciona en la mayoría de los casos pero puede requerir revisión manual en módulos con providers, forRoot/forChild o bootstrapping personalizado. |
+
+---
+
+## Posibles mejoras
+
+Áreas donde el script puede evolucionar. Contribuciones bienvenidas:
+
+- [ ] **`--from-version N`** — reanudar la migración desde un salto específico sin necesidad de restaurar snapshot
+- [ ] **Modo dry-run** — mostrar qué pasos ejecutaría sin modificar nada
+- [ ] **Auto-fix extendido** — cubrir más errores: NG0100 (ExpressionChangedAfterItHasBeenChecked), imports circulares, providers deprecados
+- [ ] **Detección de librerías populares** — ejecutar automáticamente `ng update @ngrx/store`, `ng update @angular/fire`, etc. si están presentes
+- [ ] **Reporte mejorado** — incluir sugerencias de fix para cada error, no solo el log crudo
+- [ ] **Soporte multi-app avanzado** — migrar apps en el mismo workspace en orden de dependencia
+- [ ] **Validación previa** — chequear antes de empezar si hay breaking changes conocidos en dependencias de terceros
+- [ ] **Integración con CI** — modo no-interactivo con exit codes claros para usar en pipelines
+
+---
+
 ## Contribuciones
 
 Issues y pull requests son bienvenidos. Si encontrás un caso de migración no cubierto por el script, abrí un issue con:
