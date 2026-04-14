@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, json, os, re, subprocess, sys, time, zipfile, difflib
+import argparse, html as html_lib, json, os, re, shutil, subprocess, sys, threading, time, zipfile, difflib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -23,8 +23,28 @@ TEMP_REMOVE = [
 ]
 
 # ======== Utils básicos ========
-def sh(cmd: List[str], check=True) -> subprocess.CompletedProcess:
-    print("» " + " ".join(cmd))
+def sh(cmd: List[str], check=True, live=False) -> subprocess.CompletedProcess:
+    """Ejecuta un comando. live=True muestra la salida en tiempo real (installs, builds)."""
+    print("» " + " ".join(cmd), flush=True)
+    if live:
+        stdout_lines: List[str] = []
+        stderr_lines: List[str] = []
+        proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        def _drain(stream, buf):
+            for line in stream:
+                buf.append(line)
+                print(line, end="", flush=True)
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines), daemon=True)
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines), daemon=True)
+        t_out.start(); t_err.start()
+        proc.wait(); t_out.join(); t_err.join()
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+        if check and proc.returncode != 0:
+            err = subprocess.CalledProcessError(proc.returncode, cmd)
+            err.stdout = stdout; err.stderr = stderr
+            raise err
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     return subprocess.run(cmd, text=True, capture_output=True, check=check)
 
 def log(msg: str): print(msg, flush=True)
@@ -58,6 +78,19 @@ def has_material() -> bool:
 def is_nx() -> bool:
     return Path("nx.json").exists()
 
+def detect_angular_version() -> int:
+    """Lee la versión major de @angular/core desde package.json. Retorna 13 si no puede detectarla."""
+    try:
+        pkg = json.loads(Path("package.json").read_text(encoding="utf-8"))
+        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        ver_str = deps.get("@angular/core", "")
+        m = re.search(r"(\d+)\.", ver_str.lstrip("^~>=< "))
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 13
+
 # ======== npm sin depender del PATH (usa node + npm-cli.js) ========
 def _node_exec_path() -> Path:
     p = sh(["node", "-p", "process.execPath"]).stdout.strip()
@@ -84,28 +117,28 @@ def _npm_cli_js_path() -> Path:
             return c
     raise SystemExit("❌ No se encontró npm-cli.js. Reinstala Node con npm incluido.")
 
-def npm_run(*args: str) -> subprocess.CompletedProcess:
+def npm_run(*args: str, live: bool = True) -> subprocess.CompletedProcess:
     npm_cli = _npm_cli_js_path()
     cmd = ["node", str(npm_cli), *args]
-    return sh(cmd)
+    return sh(cmd, live=live)
 
 # ======== Gestor de paquetes ========
 def pm_install(pm: str):
-    if pm == "pnpm": sh(["pnpm","install"])
-    elif pm == "yarn": sh(["yarn","install"])
+    if pm == "pnpm": sh(["pnpm","install"], live=True)
+    elif pm == "yarn": sh(["yarn","install"], live=True)
     else: npm_run("install")
 
 def pm_dedupe(pm: str):
     try:
-        if pm == "pnpm": sh(["pnpm","dedupe"])
+        if pm == "pnpm": sh(["pnpm","dedupe"], live=True)
         elif pm == "yarn": log("ℹ️ yarn no tiene dedupe estándar (omitiendo).")
         else: npm_run("dedupe")
     except subprocess.CalledProcessError as e:
         log(f"⚠️ dedupe: {e.stderr.strip()[:200]} (continuando)")
 
 def pm_add_dev(pm: str, pkg_with_ver: str):
-    if pm == "pnpm": sh(["pnpm","add","-D",pkg_with_ver])
-    elif pm == "yarn": sh(["yarn","add","-D",pkg_with_ver])
+    if pm == "pnpm": sh(["pnpm","add","-D",pkg_with_ver], live=True)
+    elif pm == "yarn": sh(["yarn","add","-D",pkg_with_ver], live=True)
     else: npm_run("install","-D",pkg_with_ver)
 
 # ======== Ejecutores (sin npx) ========
@@ -124,13 +157,13 @@ def run_ng(pm: str, cli_ver: int, *args: str) -> subprocess.CompletedProcess:
     if _ng_cli_installed_major() != cli_ver:
         pm_add_dev(pm, f"@angular/cli@{cli_ver}")
     ng_bin = ["node", str(Path("node_modules") / "@angular" / "cli" / "bin" / "ng.js")]
-    return sh(ng_bin + list(args))
+    return sh(ng_bin + list(args), live=True)
 
 def run_nx(pm: str, *args: str) -> subprocess.CompletedProcess:
     if not Path("node_modules/nx/bin/nx.js").exists():
         pm_add_dev(pm, "nx")
     nx_bin = ["node", str(Path("node_modules") / "nx" / "bin" / "nx.js")]
-    return sh(nx_bin + list(args))
+    return sh(nx_bin + list(args), live=True)
 
 def try_build_cli(pm: str, cli_ver: int, project: Optional[str], prod: bool) -> Tuple[bool,str]:
     args = ["build"] + ([project] if project else [])
@@ -264,6 +297,26 @@ def load_state() -> Dict[str,Any]:
 
 def save_state(data: Dict[str,Any]): STATE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
+def save_completed_version(v: int):
+    """Registra que el salto a la versión v se completó exitosamente."""
+    state = load_state()
+    completed = state.get("completed_versions", [])
+    if v not in completed:
+        completed.append(v)
+    state["completed_versions"] = completed
+    save_state(state)
+
+def get_last_completed_version() -> Optional[int]:
+    """Retorna la última versión migrada exitosamente, o None si no hay ninguna."""
+    completed = load_state().get("completed_versions", [])
+    return max(completed) if completed else None
+
+def reset_completed_versions():
+    """Limpia el historial de versiones completadas (para empezar de cero)."""
+    state = load_state()
+    state.pop("completed_versions", None)
+    save_state(state)
+
 class Report:
     def __init__(self):
         self.records = []
@@ -280,19 +333,26 @@ class Report:
         .ok{color:#0a7a2d}.bad{color:#b00020}
         .card{border:1px solid #e5e7eb;border-radius:10px;padding:16px;margin:12px 0}
         """
-        html = [f"<html><head><meta charset='utf-8'><style>{css}</style><title>Angular 13→20 Reporte</title></head><body>"]
-        html += [f"<h1>Reporte de migración Angular 13→20</h1><small>Inicio: {self.start_ts}</small>"]
+        html = [f"<html><head><meta charset='utf-8'><style>{css}</style><title>Angular Migración — Reporte</title></head><body>"]
+        html += [f"<h1>Reporte de migración Angular</h1><small>Inicio: {self.start_ts}</small>"]
         for rec in self.records:
-            html += [f"<div class='card'><h2>{rec['title']}</h2>"]
+            html += [f"<div class='card'><h2>{html_lib.escape(rec['title'])}</h2>"]
             html += [f"<p><b>Resultado:</b> {'<span class=ok>OK</span>' if rec['success'] else '<span class=bad>FALLÓ</span>'}</p>"]
             if rec.get("details"):
                 html += ["<details><summary><b>Detalles</b></summary><pre>"]
-                html += [rec["details"]]
+                html += [html_lib.escape(rec["details"])]
                 html += ["</pre></details>"]
             html += ["</div>"]
         html += ["</body></html>"]
         out.write_text("\n".join(html), encoding="utf-8")
         return out
+
+def clear_angular_cache():
+    """Elimina .angular/cache para evitar falsos negativos por caché corrupta."""
+    cache = Path(".angular") / "cache"
+    if cache.exists():
+        shutil.rmtree(cache, ignore_errors=True)
+        log("🧹 Caché Angular limpiada (.angular/cache)")
 
 def diff_text(a: str, b: str, fromfile="before/package.json", tofile="after/package.json") -> str:
     return "".join(difflib.unified_diff(a.splitlines(True), b.splitlines(True), fromfile, tofile))
@@ -646,6 +706,45 @@ def smart_autofix_from_log(pm: str, log_path: Path) -> int:
         pm_install(pm)
     return fixes
 
+# ======== Librerías de terceros populares ========
+# Mapa: nombre del paquete → comando ng update a ejecutar
+KNOWN_THIRD_PARTY: Dict[str, List[str]] = {
+    "@ngrx/store":              ["@ngrx/store"],
+    "@ngrx/effects":            ["@ngrx/store"],   # se migra junto con store
+    "@ngrx/entity":             ["@ngrx/store"],
+    "@ngrx/router-store":       ["@ngrx/store"],
+    "@ngrx/component-store":    ["@ngrx/store"],
+    "@angular/fire":            ["@angular/fire"],
+    "@ngx-translate/core":      ["@ngx-translate/core"],
+    "@ngneat/transloco":        ["@ngneat/transloco"],
+    "ng-zorro-antd":            ["ng-zorro-antd"],
+    "primeng":                  ["primeng"],
+    "@ng-bootstrap/ng-bootstrap": ["@ng-bootstrap/ng-bootstrap"],
+    "ngx-bootstrap":            ["ngx-bootstrap"],
+    "@swimlane/ngx-datatable":  ["@swimlane/ngx-datatable"],
+    "ngx-toastr":               ["ngx-toastr"],
+}
+
+def migrate_third_party_libs(pm: str, angular_ver: int):
+    """Detecta librerías populares en package.json y ejecuta sus migraciones ng update."""
+    try:
+        pkg = json.loads(Path("package.json").read_text(encoding="utf-8"))
+    except Exception:
+        return
+    all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+    already_run: set = set()
+    for lib, update_args in KNOWN_THIRD_PARTY.items():
+        if lib in all_deps:
+            key = update_args[0]
+            if key in already_run:
+                continue
+            already_run.add(key)
+            log(f"📦 Migrando librería de terceros: {key}")
+            try:
+                run_ng(pm, angular_ver, "update", key, "--allow-dirty", "--force")
+            except subprocess.CalledProcessError as e:
+                log(f"⚠️ {key}: {(e.stderr or '').strip()[:300]} (continuando)")
+
 # ======== Terceros ========
 def update_third_party(pm: str):
     log("🔄 Actualizando librerías de terceros (minor/patch)…")
@@ -671,7 +770,7 @@ def update_third_party(pm: str):
 
 # ======== Migración principal ========
 def migrate(snapshot_mode: str, standalone: bool, control_flow: bool, material_mdc: bool,
-            material_m3: bool, check_ssr: bool):
+            material_m3: bool, check_ssr: bool, from_version: Optional[int] = None):
     ensure_project_root()
     node_check()
     pm = detect_pm()
@@ -683,22 +782,39 @@ def migrate(snapshot_mode: str, standalone: bool, control_flow: bool, material_m
     ws = read_workspace()
     default_project = ws.get("defaultProject")
 
-    log(f"🚀 Migración Angular 13 → 20 (PM={pm}, Material={mat}, Nx={nx})")
-    log(f"🧩 Proyectos encontrados: {', '.join(projects)}")
+    # Detectar versión actual y calcular desde dónde empezar
+    current_ver = detect_angular_version()
+    last_ok = get_last_completed_version()
+
+    if from_version:
+        start_from = from_version
+        log(f"⏩ --from-version: empezando desde v{start_from} (indicado manualmente)")
+    elif last_ok and last_ok >= current_ver:
+        start_from = last_ok + 1
+        log(f"🔁 Reanudando desde v{start_from} (último salto exitoso: v{last_ok})")
+    else:
+        start_from = current_ver + 1
+
+    if start_from > 20:
+        log("✅ El proyecto ya está en Angular 20. Nada que migrar.")
+        return
+
+    log(f"🚀 Migración Angular {current_ver} → 20  (PM={pm}, Material={mat}, Nx={nx})")
+    log(f"🧩 Proyectos: {', '.join(projects)}")
     if default_project: log(f"⭐ Proyecto por defecto: {default_project}")
+    log(f"📋 Pasos a ejecutar: v{start_from} → v20")
 
     report = Report()
 
-    for v in range(14, 21):
+    for v in range(start_from, 21):
+        log(f"\n{'='*50}\n🔷 Salto Angular {v-1} → {v}\n{'='*50}")
         make_snapshot(f"pre_v{v}", snapshot_mode)
 
-        # Pin TS apropiado y fixes previos al salto
         pin_typescript_for(pm, v)
         if v == 14:
             temp_remove_incompatible(pm)
         align_cli_and_builder(pm, v)
 
-        # 🔧 Normaliza MaterialModule(s) solo si el proyecto usa Material y ya tiene el archivo
         if mat:
             fixed_mats = update_existing_material_modules()
             if fixed_mats:
@@ -722,25 +838,30 @@ def migrate(snapshot_mode: str, standalone: bool, control_flow: bool, material_m
             except subprocess.CalledProcessError as e:
                 log(f"⚠️ Material v{v}: {(e.stderr or '').strip()[:200]} (continuando)")
 
+        # Librerías de terceros populares
+        migrate_third_party_libs(pm, v)
+
         # Builder nuevo desde v18
         if v >= 18:
             aj = Path("angular.json").read_text(encoding="utf-8", errors="ignore")
-            if '"@angular-devkit/build-angular:application"' not in aj:
+            if '"@angular-devkit/build-angular:application"' not in aj and \
+               '"@angular/build:application"' not in aj:
                 try:
-                    run_ng(pm, v, "update", "@angular/cli", "--migrate-only", "--name", "use-application-builder", "--allow-dirty", "--force")
+                    run_ng(pm, v, "update", "@angular/cli", "--migrate-only",
+                           "--name", "use-application-builder", "--allow-dirty", "--force")
                 except subprocess.CalledProcessError:
                     log("⚠️ use-application-builder no se pudo aplicar automáticamente (continuando)")
 
         pm_install(pm); pm_dedupe(pm)
 
+        # Limpiar caché antes del build
+        clear_angular_cache()
+
         # Build (con reintento y autofix)
         all_ok = True
-        outputs=[]
+        outputs = []
         for prj in projects:
-            if nx:
-                ok, out = try_build_nx(pm, prj, prod=True)
-            else:
-                ok, out = try_build_cli(pm, v, prj, prod=True)
+            ok, out = try_build_nx(pm, prj, prod=True) if nx else try_build_cli(pm, v, prj, prod=True)
             outputs.append(out[-4000:])
             all_ok = all_ok and ok
 
@@ -749,33 +870,45 @@ def migrate(snapshot_mode: str, standalone: bool, control_flow: bool, material_m
             applied = smart_autofix_from_log(pm, LAST_ERR)
             if applied > 0:
                 log(f"🛠️  Autofixes aplicados: {applied}. Reintentando build v{v}…")
+                clear_angular_cache()
                 all_ok = True
-                outputs=[]
+                outputs = []
                 for prj in projects:
-                    if nx:
-                        ok, out = try_build_nx(pm, prj, prod=True)
-                    else:
-                        ok, out = try_build_cli(pm, v, prj, prod=True)
+                    ok, out = try_build_nx(pm, prj, prod=True) if nx else try_build_cli(pm, v, prj, prod=True)
                     outputs.append(out[-4000:])
                     all_ok = all_ok and ok
 
         if not all_ok:
             LAST_ERR.write_text("\n\n".join(outputs), encoding="utf-8")
             diff = diff_text(pkg_before, Path("package.json").read_text(encoding="utf-8"))
-            report.add({"title": f"Build v{v}", "success": False, "details": (diff + "\n\n" + ("\n\n".join(outputs)))[-6000:]})
+            report.add({"title": f"Build v{v}", "success": False,
+                        "details": (diff + "\n\n" + "\n\n".join(outputs))[-6000:]})
             outpath = report.write_html()
-            sys.exit(f"❌ Build falló en v{v}. Reporte: {outpath}")
+            sys.exit(f"❌ Build falló en v{v}. Reporte: {outpath}\n"
+                     f"   Corregí el error y volvé a ejecutar — reanudará desde v{v}.")
+
+        # Build SSR opcional
+        if check_ssr:
+            for prj in projects:
+                if project_has_server_target(prj):
+                    log(f"🌐 Comprobando SSR para '{prj}' en v{v}…")
+                    ok, out = try_build_server_nx(pm, prj) if nx else try_build_server_cli(pm, v, prj)
+                    if not ok:
+                        log(f"⚠️ SSR build falló para '{prj}' en v{v}: {out[-500:]}")
 
         make_snapshot(f"post_v{v}", snapshot_mode)
         diff = diff_text(pkg_before, Path("package.json").read_text(encoding="utf-8"))
-        report.add({"title": f"Salto v{v}", "success": True, "details": diff if diff.strip() else "Sin cambios relevantes en package.json"})
+        report.add({"title": f"Salto v{v}", "success": True,
+                    "details": diff if diff.strip() else "Sin cambios relevantes en package.json"})
+        save_completed_version(v)
+        log(f"✅ v{v} completado.")
 
     # Codemods opcionales (ya en v20)
     if control_flow:
         try: run_ng(pm, 20, "generate", "@angular/core:control-flow")
         except subprocess.CalledProcessError as e: log(f"⚠️ control-flow: {(e.stderr or '').strip()[:200]}")
     if standalone:
-        for mode in ("convert-to-standalone","remove-ng-modules","bootstrap"):
+        for mode in ("convert-to-standalone", "remove-ng-modules", "bootstrap"):
             try: run_ng(pm, 20, "generate", "@angular/core:standalone", f"--mode={mode}")
             except subprocess.CalledProcessError as e: log(f"⚠️ standalone ({mode}): {(e.stderr or '').strip()[:200]}")
     if has_material() and material_mdc:
@@ -791,21 +924,22 @@ def migrate(snapshot_mode: str, standalone: bool, control_flow: bool, material_m
     except subprocess.CalledProcessError: log("ℹ️ Lint no configurado o falló (continuando).")
 
     # Build final
+    clear_angular_cache()
     final_ok = True
-    outputs=[]
+    outputs = []
     for prj in projects:
-        if nx: ok, out = try_build_nx(pm, prj, prod=True)
-        else:  ok, out = try_build_cli(pm, 20, prj, prod=True)
+        ok, out = try_build_nx(pm, prj, prod=True) if nx else try_build_cli(pm, 20, prj, prod=True)
         outputs.append(out[-2000:])
         final_ok = final_ok and ok
 
     make_snapshot("final_ok", snapshot_mode)
     if not final_ok:
         LAST_ERR.write_text("\n\n".join(outputs), encoding="utf-8")
-        report.add({"title": "Build final", "success": False, "details": ("\n\n".join(outputs))[-6000:]})
+        report.add({"title": "Build final", "success": False, "details": "\n\n".join(outputs)[-6000:]})
         outpath = report.write_html()
         sys.exit(f"❌ Build final falló. Reporte: {outpath}")
 
+    reset_completed_versions()  # limpia el estado — migración completada
     report.add({"title": "Completado", "success": True, "details": "Migración terminada y compilación OK."})
     outpath = report.write_html()
     log(f"\n✅ Migración completada a Angular 20. Reporte: {outpath}")
@@ -813,19 +947,29 @@ def migrate(snapshot_mode: str, standalone: bool, control_flow: bool, material_m
 
 # ======== CLI ========
 def main():
-    ap = argparse.ArgumentParser(description="Angular 13→20 SIN npx, snapshots, reporte HTML, CLI/Nx y fixes automáticos (Material + módulos desconocidos).")
-    ap.add_argument("--snapshot", choices=["full","lite","off"], default="lite", help="Modo de snapshot (default: lite)")
-    ap.add_argument("--standalone", action="store_true", help="Aplicar codemods Standalone")
-    ap.add_argument("--control-flow", action="store_true", help="Convertir *ngIf/*ngFor/*ngSwitch a @if/@for/@switch")
-    ap.add_argument("--material-mdc", action="store_true", help="Aplicar MDC migration (Material)")
-    ap.add_argument("--material-m3", action="store_true", help="Generar base de tema Material 3")
-    ap.add_argument("--check-ssr", action="store_true", help="Intentar compilar :server si existe (SSR)")
-    ap.add_argument("--restore", type=str, help="Restaura snapshot: nombre.zip o 'latest'")
+    ap = argparse.ArgumentParser(
+        description="Migra proyectos Angular automaticamente (v13 a v20). "
+                    "Sin npx, con snapshots, reporte HTML, soporte CLI/Nx y auto-fix."
+    )
+    ap.add_argument("--snapshot", choices=["full","lite","off"], default="lite",
+                    help="Modo de snapshot: full=todos los archivos, lite=solo código, off=sin backups (default: lite)")
+    ap.add_argument("--standalone",    action="store_true", help="Aplicar codemods Standalone al final")
+    ap.add_argument("--control-flow",  action="store_true", help="Convertir *ngIf/*ngFor/*ngSwitch a @if/@for/@switch")
+    ap.add_argument("--material-mdc",  action="store_true", help="Aplicar MDC migration (Angular Material)")
+    ap.add_argument("--material-m3",   action="store_true", help="Generar base de tema Material 3")
+    ap.add_argument("--check-ssr",     action="store_true", help="Compilar target :server en cada paso si existe (SSR)")
+    ap.add_argument("--from-version",  type=int, metavar="N", choices=range(14, 21),
+                    help="Empezar la migración desde la versión N (14-20), saltando versiones anteriores")
+    ap.add_argument("--restore",       type=str, help="Restaurar snapshot: nombre.zip o 'latest'")
     args = ap.parse_args()
 
     if args.restore:
         restore_snapshot(args.restore); return
-    migrate(args.snapshot, args.standalone, args.control_flow, args.material_mdc, args.material_m3, args.check_ssr)
+    migrate(
+        args.snapshot, args.standalone, args.control_flow,
+        args.material_mdc, args.material_m3, args.check_ssr,
+        from_version=args.from_version,
+    )
 
 if __name__ == "__main__":
     main()
